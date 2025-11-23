@@ -1,0 +1,394 @@
+---
+output:
+  pdf_document:
+    latex_engine: xelatex
+---
+
+
+```{r setup, include=FALSE}
+# Set CRAN mirror (for installs done in the Console, not in this Rmd)
+options(repos = c(CRAN = "https://cloud.r-project.org/"))
+install.packages("xgboost")
+
+# Global knitr options
+knitr::opts_chunk$set(echo = TRUE)
+
+# load all needed packages
+library(readxl)
+library(dplyr)
+library(janitor)
+library(stringr)
+library(readr)
+library(xgboost)   # make sure this is installed via install.packages("xgboost")
+library(knitr)
+```
+
+```{r, include=FALSE}
+library(readxl)
+library(dplyr)
+library(janitor)
+library(stringr)
+library(readr)
+
+set.seed(123)
+
+raw <- read_csv("C:/Users/asus/Desktop/Quarterly_Census_of_Employment_and_Wages_Annual_Data__Beginning_2000_20251107.csv",
+                show_col_types = FALSE)   # 这样也顺便关掉提示
+raw <- clean_names(raw)
+
+salary_col     <- names(raw)[str_detect(names(raw), "annual.*average.*salary")]
+employment_col <- names(raw)[str_detect(names(raw), "average.*employment")]
+
+if (length(salary_col) != 1) stop("Cannot identify salary column.")
+if (length(employment_col) != 1) stop("Cannot identify employment column.")
+
+df_clean <- raw %>%
+  mutate(
+    naics              = parse_number(as.character(naics)),
+    year               = parse_number(as.character(year)),
+    establishments     = parse_number(as.character(establishments)),
+    avg_employment     = parse_number(as.character(.data[[employment_col]])),
+    total_wage         = parse_number(as.character(total_wage)),
+    annual_avg_salary  = parse_number(as.character(.data[[salary_col]])),
+    ownership_num = case_when(
+      str_to_lower(ownership) == "private"               ~ 0,
+      str_to_lower(ownership) == "local government"      ~ 1,
+      str_to_lower(ownership) == "state government"      ~ 2,
+      str_to_lower(ownership) == "federal government"    ~ 3,
+      str_to_lower(ownership) == "total, all government" ~ 4,
+      str_to_lower(ownership) == "total, all ownerships" ~ 5,
+      TRUE ~ NA_real_
+    )
+  )
+```
+
+```{r model function, include=FALSE}
+model_df <- df_clean %>%
+  transmute(
+    Employment        = avg_employment,
+    Total_Wage        = total_wage,
+    Year              = year,
+    Ownership_Num     = ownership_num,
+    Annual_Avg_Salary = annual_avg_salary
+  ) %>%
+  na.omit()
+```
+
+```{r test split, include=FALSE}
+# ---- Train / Dev / Test split ----
+set.seed(123)
+n <- nrow(model_df)
+
+train_idx     <- sample(1:n, size = floor(0.70 * n))
+remaining_idx <- setdiff(1:n, train_idx)
+dev_idx       <- sample(remaining_idx, size = floor(0.15 * n))
+test_idx      <- setdiff(remaining_idx, dev_idx)
+
+train_data <- model_df[train_idx, ]
+dev_data   <- model_df[dev_idx, ]
+test_data  <- model_df[test_idx, ]
+```
+
+```{r ols_calc, include=FALSE}
+# OLS model and RMSE/CV calculations
+
+ols_model <- lm(
+  Annual_Avg_Salary ~ Employment + Total_Wage + Year + Ownership_Num,
+  data = train_data
+)
+
+dev_pred  <- predict(ols_model, newdata = dev_data)
+test_pred <- predict(ols_model, newdata = test_data)
+
+rmse_dev  <- sqrt(mean((dev_data$Annual_Avg_Salary  - dev_pred)^2))
+rmse_test <- sqrt(mean((test_data$Annual_Avg_Salary - test_pred)^2))
+
+set.seed(123)
+k     <- 5
+folds <- sample(rep(1:k, length.out = nrow(train_data)))
+cv_rmse <- numeric(k)
+
+for (i in 1:k) {
+  fold_train <- train_data[folds != i, ]
+  fold_valid <- train_data[folds == i, ]
+  
+  m <- lm(
+    Annual_Avg_Salary ~ Employment + Total_Wage + Year + Ownership_Num,
+    data = fold_train
+  )
+  
+  pred <- predict(m, newdata = fold_valid)
+  cv_rmse[i] <- sqrt(mean((fold_valid$Annual_Avg_Salary - pred)^2))
+}
+
+mean_cv_rmse <- mean(cv_rmse)
+
+results_ols <- data.frame(
+  Model     = "Baseline OLS",
+  CV_RMSE   = mean_cv_rmse,
+  Dev_RMSE  = rmse_dev,
+  Test_RMSE = rmse_test
+)
+```
+
+```{r xgb_calc, include=FALSE}
+# ---- Prepare matrices for xgboost ----
+
+x_train <- model.matrix(Annual_Avg_Salary ~ Employment + Total_Wage + Year + Ownership_Num,
+                        data = train_data)[, -1]
+
+y_train <- train_data$Annual_Avg_Salary
+
+x_dev   <- model.matrix(Annual_Avg_Salary ~ Employment + Total_Wage + Year + Ownership_Num,
+                        data = dev_data)[, -1]
+y_dev   <- dev_data$Annual_Avg_Salary
+
+x_test  <- model.matrix(Annual_Avg_Salary ~ Employment + Total_Wage + Year + Ownership_Num,
+                        data = test_data)[, -1]
+y_test  <- test_data$Annual_Avg_Salary
+
+dtrain <- xgb.DMatrix(data = x_train, label = y_train)
+
+# ---- Train XGBoost model (fast!) ----
+xgb_model <- xgboost(
+  data = dtrain,
+  objective = "reg:squarederror",
+  nrounds = 200,
+  max_depth = 6,
+  eta = 0.1,
+  verbose = 0
+)
+
+# ---- Predictions ----
+xgb_dev_pred  <- predict(xgb_model, x_dev)
+xgb_test_pred <- predict(xgb_model, x_test)
+
+# ---- RMSE ----
+rmse_xgb_dev  <- sqrt(mean((y_dev  - xgb_dev_pred)^2))
+rmse_xgb_test <- sqrt(mean((y_test - xgb_test_pred)^2))
+
+# ---- CV RMSE with xgboost built-in cross-validation (no loops) ----
+cv <- xgb.cv(
+  data = dtrain,
+  objective = "reg:squarederror",
+  nrounds = 200,
+  nfold = 5,
+  verbose = 0,
+  early_stopping_rounds = 10
+)
+
+cv_rmse_xgb <- min(cv$evaluation_log$test_rmse_mean)
+
+# ---- Final table ----
+xgb_results <- data.frame(
+  Model     = "XGBoost",
+  CV_RMSE   = cv_rmse_xgb,
+  Dev_RMSE  = rmse_xgb_dev,
+  Test_RMSE = rmse_xgb_test
+)
+```
+
+\begin{center}
+{\Large \textbf{MTH 4330: Intermediate Report}}\\[8pt]
+\textbf{Predicting Wage Inequality Across New York State Industries and Regions}\\[14pt]
+
+Group 7: Fnu Tenzin Dhonyo, Thomas Lee, Trisha Wu, Jordan Yim\\[10pt]
+November 19, 2025
+\end{center}
+
+# Introduction
+
+This project investigates wage inequality across industries and regions in New York State using machine learning techniques applied to the Quarterly Census of Employment and Wages (QCEW) dataset. Our task is to predict average annual wages based on multiple factors including industry classification (NAICS code), geographic location (county/region), employment size, ownership type (private vs. government), and temporal trends from 2015 to 2024.
+
+Since our project proposal, we have made progress in implementing a complete data pipeline and training baseline models. The motivation remains unchanged: understanding wage disparities is critical for career planning, policy design, and ensuring fair compensation. This period (2015–2024) captures significant economic shifts including technological expansion and the COVID-19 pandemic disruption.
+
+**Progress Summary:** We have successfully loaded and cleaned the QCEW dataset, performed exploratory data analysis, engineered relevant features, and trained two models: a baseline linear regression and an XGBoost regression model. Initial results show promising predictive performance with room for improvement through hyperparameter tuning and additional feature engineering.
+
+# Background
+
+Prior research on wage inequality primarily uses regression-based decomposition methods and supply-demand frameworks to explain historical wage structures. These approaches, while valuable for understanding past trends, often fail to capture complex, high-dimensional interactions across technology adoption, policy changes, and demographic shifts (Autor & Katz, 1999).
+
+The QCEW dataset provides near-census coverage of employment and wages in New York State, covering approximately 97% of nonfarm employment. However, the data presents several practical challenges including confidentiality suppression for small establishments, NAICS industry reclassification over time, and place-of-work counting that may double-count individuals with multiple jobs (New York State Department of Labor, 2024).
+
+Our contribution is a predictive machine learning approach that leverages historical QCEW data to produce interpretable, forward-looking wage estimates. Unlike traditional econometric models, our ensemble methods can capture nonlinear relationships between predictors and identify complex interactions between industry, geography, and time.
+
+# Dataset
+
+### Dataset Description
+
+Our dataset comes from the New York State Quarterly Census of Employment and Wages (QCEW) and contains **231,777 rows**, each representing an industry–region–year record. After cleaning, we focus on the following features:
+
+- **Average Employment** : average employee count per NAICS industry and region.  
+- **Total Wage** : total annual wages paid in that industry–region–year.  
+- **Year** : reporting year (2015–2024).  
+- **Ownership** : encoded from categories such as Private, Local Government, and Total, All Ownerships using numeric labels.  
+- **Annual Average Salary** : total wage divided by average employment.
+
+Additional fields such as **NAICS code**, **NAICS title**, and **region/area** support filtering and EDA but are not included in the baseline models.
+
+### Train/Dev/Test Split
+
+Given the dataset size, we use a standard random split:
+
+- **Training set (70%)**: 162,244   
+- **Development/validation set (15%)**: 34,767   
+- **Test set (15%)**: 34,767   
+
+We also apply **5-fold cross-validation** on the training set to obtain stable performance estimates and guide model selection.
+
+### Evaluation Metrics
+
+Because our target variable (annual average salary) is continuous, we evaluate model performance using standard regression metrics:
+
+- **Mean Squared Error (MSE):** Measures average squared prediction error. This is the loss minimized by our OLS model and is sensitive to large errors.
+- **Root Mean Squared Error (RMSE):** Square root of MSE, expressed in salary units (dollars). RMSE provides an interpretable measure of the typical prediction error.
+- **\(R^2\) (Coefficient of Determination):** Indicates the proportion of variance in salaries explained by the model; useful for comparing overall model fit.
+
+Together, these metrics allow us to quantify both *accuracy* (RMSE), *error sensitivity* (MSE), and *explanatory power* (\(R^2\)) across our baseline and ensemble models.
+
+
+# Methods
+## Baseline Method: Ordinary Least Squares (OLS)
+
+**Feature Construction:**  
+All features are cleaned, but no standardization is applied because the units are interpretable and OLS does not require scaling for accurate coefficient estimation..  
+The categorical Ownership variable is encoded into numerical labels.  
+The response variable, Annual Average Salary, is computed as Total Wage divided by Average Employment.
+
+**Input-to-Output Mapping:**  
+The model predicts annual average salary using the linear function:
+\[
+\hat{y} = \beta_0 + \beta_1(\text{Employment}) + \beta_2(\text{Total Wage}) 
++ \beta_3(\text{Year}) + \beta_4(\text{Ownership}) + \epsilon.
+\]
+
+**Mapping Steps:**
+
+1. Continuous inputs (Employment, Total Wage, Year) are multiplied by their corresponding coefficients.
+2. The encoded Ownership value contributes an additive shift determined by its coefficient.  
+3. The intercept \(\beta_0\) and all weighted feature contributions are summed to produce the prediction \(\hat{y}\).
+
+---
+
+## Machine Learning Method: XGBoost Regression
+
+**Feature Construction:**  
+XGBoost uses the same cleaned and encoded features as OLS.  
+No standardization is required because tree-based boosting models operate
+directly on raw feature scales.
+
+**Input-to-Output Mapping:**  
+XGBoost builds a sequence of small regression trees, where each new tree
+learns to correct the errors of the previous model.  
+The final prediction is the sum of contributions from all trees, allowing
+the model to capture nonlinear patterns more effectively than OLS.
+
+**Key Hyperparameters:**  
+- **nrounds:** number of boosting iterations (trees)  
+- **eta:** learning rate controlling how much each tree contributes  
+- **max_depth:** complexity of individual trees  
+- **subsample / colsample_bytree:** introduce randomness and prevent overfitting  
+
+Hyperparameters are selected using **XGBoost’s built-in 5-fold
+cross-validation**, and we choose the iteration with the lowest
+validation RMSE (early stopping).
+
+
+## Experiments
+
+We evaluate OLS and XGBoost using 5-fold cross-validation and RMSE on the
+development and test sets. Table 1 shows that XGBoost achieves lower error across
+all splits.
+
+The predicted-vs-actual scatterplots highlight this gap. OLS produces a diffuse
+cloud far from the 45-degree line, reflecting systematic under- and over-
+prediction. In contrast, XGBoost predictions cluster closely around the
+diagonal, indicating much better alignment with true wages and an ability to
+capture nonlinear patterns that OLS cannot.
+
+Overall, XGBoost is the stronger model for QCEW wage prediction, supported by
+both RMSE metrics and visual model fit.
+
+```{r comparison_table, echo=FALSE}
+# Combined results table
+all_results <- dplyr::bind_rows(results_ols, xgb_results)
+
+knitr::kable(
+  all_results,
+  digits = 2,
+  caption = "Table 1: Comparison of OLS and XGBoost Model Performance (RMSE)"
+)
+```
+
+
+```{r ols_plot, echo=FALSE}
+library(ggplot2)
+
+ols_plot_df <- data.frame(
+  Actual = test_data$Annual_Avg_Salary,
+  Predicted = predict(ols_model, newdata = test_data)
+)
+
+ggplot(ols_plot_df, aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.35, color = "#555555") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  labs(
+    title = "OLS: Actual vs Predicted (Test Set)",
+    x = "Actual Salary",
+    y = "Predicted Salary"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+
+
+```{r xgb_plot, echo=FALSE}
+xgb_plot_df <- data.frame(
+  Actual = test_data$Annual_Avg_Salary,
+  Predicted = xgb_test_pred
+)
+
+ggplot(xgb_plot_df, aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.35, color = "#1c75bc") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  labs(
+    title = "XGBoost: Actual vs Predicted (Test Set)",
+    x = "Actual Salary",
+    y = "Predicted Salary"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## Conclusion
+
+Our error analysis on the development set shows clear differences between the two
+models. OLS exhibits larger systematic errors, especially for industries with
+very high or very low wage levels. Its residuals indicate consistent
+under-prediction for high-wage sectors and over-prediction for low-wage sectors,
+reflecting the limits of a linear specification.
+
+In contrast, XGBoost errors are smaller and more evenly distributed, although the
+model still struggles with extreme wage values and sharp year-to-year
+fluctuations. These poorly predicted cases generally correspond to industries
+with volatile employment or irregular wage spikes.
+
+Based on these findings, we propose two actionable improvements:
+
+1. **Add nonlinear or interaction features** (e.g., log transformations, spline
+terms, or Year × Industry effects) to better capture structural heterogeneity.
+2. **Incorporate additional predictors** such as region indicators, NAICS
+subgroup dummies, or lagged wage features to provide more signal for volatile
+industries.
+
+These refinements should reduce error variance and improve overall predictive
+performance for the final report.
+
+# References
+
+Autor, D. H., & Katz, L. F. (1999). Changes in the wage structure and earnings inequality. *Handbook of Labor Economics*, *3*, 1463–1555. https://doi.org/10.1016/S1573-4463(99)03007-2
+
+Chen, T., & Guestrin, C. (2016). XGBoost: A scalable tree boosting system. *Proceedings of the 22nd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining*, 785–794. https://doi.org/10.1145/2939672.2939785
+
+Friedman, J., Hastie, T., & Tibshirani, R. (2009). *The elements of statistical learning: Data mining, inference, and prediction* (2nd ed.). Springer.
+
+New York State Department of Labor. (n.d.). *Quarterly Census of Employment and Wages (QCEW) Annual Data* [Dataset]. New York Open Data. https://data.ny.gov/Economic-Development/Quarterly-Census-of-Employment-and-Wages-Annual-Da/shc7-xcbw
